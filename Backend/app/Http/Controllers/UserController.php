@@ -8,25 +8,25 @@ use App\Mail\WelcomeEmail;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
-use Illuminate\Support\Facades\Cookie;
-use Illuminate\Support\Facades\Crypt;
-use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
 use App\Mail\ResetPasswordEmail;
 use App\Mail\ResetPasswordsuccess;
+
 class UserController extends Controller
 {
     public function signup(Request $request)
     {
         $data = Validator::make($request->all(), [
-            'name' => 'required',
+            'name' => 'required|string|max:255',
             'email' => 'required|email|unique:users',
             'password' => 'required|min:10',
         ]);
+
         if ($data->fails()) {
             return response()->json([
                 'success' => false,
@@ -34,6 +34,7 @@ class UserController extends Controller
                 'errors' => $data->errors(),
             ], 422);
         }
+
         $validatedData = $data->validated();
         $verificationToken = (string) random_int(100000, 999999);
 
@@ -42,28 +43,32 @@ class UserController extends Controller
             'email' => $validatedData['email'],
             'password' => Hash::make($validatedData['password']),
             'verificationToken' => $verificationToken,
-            'verificationTokenExpiresAt' => Carbon::now()->addHours(24)
+            'verificationTokenExpiresAt' => Carbon::now()->addHours(24),
         ]);
-        $token = $user->createToken('accesstoken')->plainTextToken;
+
+
+        $request->session()->regenerate();
+        Auth::login($user);
 
         try {
-            Mail::to('aymanejouda5@gmail.com')->send(new VerificationEmail($verificationToken));
+            Mail::to($user->email)->send(new VerificationEmail($verificationToken));
         } catch (\Exception $e) {
             Log::error('Email sending failed: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'User created, but email verification failed.',
-            ], 500);
         }
 
         return response()->json([
             'success' => true,
-            'user' => $user->makeHidden('password',
-            'verificationToken','verificationTokenExpiresAt','resetPasswordToken','resetPasswordExpiresAt'),
+            'user' => $user->makeHidden([
+                'password',
+                'verificationToken',
+                'verificationTokenExpiresAt',
+                'resetPasswordToken',
+                'resetPasswordExpiresAt',
+            ]),
             'message' => 'User created successfully.',
-            'token' => $token,
-        ])->cookie('accesstoken', $token, 8640, '/', null, false, true, false,'Lax');
+        ], 201);
     }
+
     public function login(Request $request)
     {
         $data = Validator::make($request->all(), [
@@ -83,17 +88,10 @@ class UserController extends Controller
 
         $user = User::where('email', $validatedData['email'])->first();
 
-        if (!$user) {
+        if (!$user || !Hash::check($validatedData['password'], $user->password)) {
             return response()->json([
                 'success' => false,
                 'message' => 'Invalid credentials',
-            ], 401);
-        }
-
-        if (!Hash::check($validatedData['password'], $user->password)) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Invalid credentials.',
             ], 401);
         }
 
@@ -104,141 +102,224 @@ class UserController extends Controller
             ], 400);
         }
 
-        $token = $user->createToken('accesstoken')->plainTextToken;
+
+        $request->session()->regenerate();
+        Auth::login($user);
         $user->lastlogin = Carbon::now();
+        $user->save();
+
         return response()->json([
             'success' => true,
             'message' => 'Login successful.',
-            'user' => $user->makeHidden('password','verificationToken',
-            'verificationTokenExpiresAt','resetPasswordToken','resetPasswordExpiresAt'), 
-            'token' => $token,
-        ])->cookie('accesstoken', $token, 8640);
+            'user' => $user->makeHidden([
+                'password',
+                'verificationToken',
+                'verificationTokenExpiresAt',
+                'resetPasswordToken',
+                'resetPasswordExpiresAt',
+            ]),
+        ]);
     }
-    
+
     public function verifyemail(Request $request)
     {
-        $token = $request->code;
+        $data = Validator::make($request->all(), [
+            'code' => 'required|string',
+        ]);
+
+        if ($data->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed.',
+                'errors' => $data->errors(),
+            ], 422);
+        }
+
+        $token = $data->validated()['code'];
 
         $user = User::where('verificationToken', $token)
             ->where('verificationTokenExpiresAt', '>=', now())
             ->first();
 
         if (!$user) {
-            return response()->json(['success' => false, 'message' => 'invalid or expired token'], 400);
+            return response()->json(['success' => false, 'message' => 'Invalid or expired token'], 400);
         }
+
         $user->isVerified = true;
         $user->verificationToken = null;
         $user->verificationTokenExpiresAt = null;
         $user->save();
+
         try {
-            Mail::to('aymanejouda5@gmail.com')->send(new WelcomeEmail($user->name, $user->email));
+            Mail::to($user->email)->send(new WelcomeEmail($user->name, $user->email));
         } catch (\Exception $e) {
             Log::error('Email sending failed: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => '  welcome email sent  failed.',
-            ], 500);
         }
+
         return response()->json([
             'success' => true,
-            'user' => $user->makeHidden('password','resetPasswordToken','resetPasswordExpiresAt'),
+            'user' => $user->makeHidden(['password', 'resetPasswordToken', 'resetPasswordExpiresAt']),
             'message' => 'Email verified successfully',
         ]);
     }
+
     public function logoutt(Request $request)
     {
-        $request->user()->tokens()->delete();
-        Cookie::queue(Cookie::forget('accesstoken'));
 
-        return response()->json(['success' => true, 'message' => 'Logged out successfully'])
-        ->cookie('accesstoken', '');
+        Auth::guard('web')->logout();
+
+        $request->session()->invalidate();
+        $request->session()->regenerateToken();
+
+        return response()->json(['success' => true, 'message' => 'Logged out successfully']);
     }
+
     public function forogotpassword(Request $request)
     {
-        $email = $request->email;
-        $user = User::where('email', $email)->first();
-      
-        $resettoken =  bin2hex(random_bytes(6));
-        $resettokenexpiresat = now()->addMinutes(6);
-        $user->resetPasswordToken = $resettoken;
+        $data = Validator::make($request->all(), [
+            'email' => 'required|email',
+        ]);
+
+        if ($data->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed.',
+                'errors' => $data->errors(),
+            ], 422);
+        }
+
+        $user = User::where('email', $data->validated()['email'])->first();
+
+        if (!$user) {
+            return response()->json([
+                'success' => true,
+                'message' => 'If this email exists, a reset link has been sent.',
+            ]);
+        }
+
+        $resettoken = bin2hex(random_bytes(32));
+        $resettokenexpiresat = now()->addMinutes(15);
+        $user->resetPasswordToken = hash('sha256', $resettoken);
         $user->resetPasswordExpiresAt = $resettokenexpiresat;
         $user->save();
+
         try {
-            Mail::to('aymanejouda5@gmail.com')->send(new ResetPasswordEmail('http://localhost:5173/reset-password/' . $resettoken));
+            Mail::to($user->email)->send(new ResetPasswordEmail('http://localhost:5173/reset-password/' . $resettoken));
         } catch (\Exception $e) {
             Log::error('Email sending failed: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
-                'message' => '  reset password email sent  failed.',
+                'message' => 'Reset password email failed to send.',
             ], 500);
         }
+
         return response()->json([
             'success' => true,
-            'message' => 'Password reset link sent to your email',
-        ], 200);
+            'message' => 'If this email exists, a reset link has been sent.',
+        ]);
     }
+
     public function resetpassword(Request $request, $passtoken)
     {
-        $paswword = $request->password;
-        $user = User::where('resetPasswordToken', $passtoken)
-        ->where('resetPasswordExpiresAt', '>', now())->first();
+        $data = Validator::make($request->all(), [
+            'password' => 'required|min:10',
+        ]);
+
+        if ($data->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed.',
+                'errors' => $data->errors(),
+            ], 422);
+        }
+
+        $hashedIncomingToken = hash('sha256', $passtoken);
+
+        $user = User::where('resetPasswordToken', $hashedIncomingToken)
+            ->where('resetPasswordExpiresAt', '>', now())
+            ->first();
+
         if (!$user) {
             return response()->json([
                 'success' => false,
-                'errors' => 'invalid or expired token'
+                'message' => 'Invalid or expired token',
             ], 400);
         }
-        try{
-            Mail::to('aymanejouda5@gmail.com')->send(new ResetPasswordsuccess());
 
-        }
-        catch(\Exception $e){
-            return response()->json([
-                'success' => false,
-                'message' => 'password reset email sent failed',
-            ],500);
-        }
-        $user->password = bcrypt($paswword);
+        $user->password = Hash::make($data->validated()['password']);
         $user->resetPasswordToken = null;
         $user->resetPasswordExpiresAt = null;
         $user->save();
-       
+
+        
+       /* if (config('session.driver') === 'database') {
+            DB::table(config('session.table', 'sessions'))
+                ->where('user_id', $user->id)
+                ->delete();
+        }*/
+
+        try {
+            Mail::to($user->email)->send(new ResetPasswordsuccess());
+        } catch (\Exception $e) {
+            Log::error('Email sending failed: ' . $e->getMessage());
+        }
+
         return response()->json([
             'success' => true,
             'message' => 'Password reset successfully',
-        ], 200);
+        ]);
     }
-    public function authcheck (Request $request){
-        $user=$request->user();
-        return response()->json([
-            'success' => true,
-          'user'=>  $user],200);
-    }
-    public function ResendverifyEmail(Request $request){
-        $email=$request->email;
-        $user=User::where('email',$email)->first();
-        if($user->isVerified){
+
+  
+
+    public function ResendverifyEmail(Request $request)
+    {
+        $data = Validator::make($request->all(), [
+            'email' => 'required|email',
+        ]);
+
+        if ($data->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed.',
+                'errors' => $data->errors(),
+            ], 422);
+        }
+
+        $user = User::where('email', $data->validated()['email'])->first();
+
+        if (!$user) {
+            return response()->json([
+                'success' => false,
+                'message' => 'User not found',
+            ], 404);
+        }
+
+        if ($user->isVerified) {
             return response()->json([
                 'success' => false,
                 'message' => 'Your email is already verified',
-                ], 400);
-                
+            ], 400);
         }
+
         $verificationToken = (string) random_int(100000, 999999);
         $user->verificationToken = $verificationToken;
+        $user->verificationTokenExpiresAt = Carbon::now()->addHours(24);
+        $user->save();
+
         try {
-            Mail::to('aymanejouda5@gmail.com')->send(new VerificationEmail($verificationToken));
+            Mail::to($user->email)->send(new VerificationEmail($verificationToken));
         } catch (\Exception $e) {
             Log::error('Email sending failed: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
-                'message' => 'User created, but email verification failed.',
+                'message' => 'Failed to send verification email.',
             ], 500);
         }
-        $user->save();
+
         return response()->json([
             'success' => true,
             'message' => 'Verification email sent successfully',
-            ], 200);
+        ]);
     }
 }
